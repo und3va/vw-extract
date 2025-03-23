@@ -1,0 +1,378 @@
+name: Extract Vaultwarden Binaries (Alpine & Debian)
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 */12 * * *'  
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  check-and-prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      release_version: ${{ steps.get_version.outputs.RELEASE_VERSION }}
+      alpine_release_exists: ${{ steps.check_alpine_release.outputs.exists }}
+      debian_release_exists: ${{ steps.check_debian_release.outputs.exists }}
+      alpine_release_id: ${{ steps.get_alpine_release_id.outputs.RELEASE_ID }}
+      debian_release_id: ${{ steps.get_debian_release_id.outputs.RELEASE_ID }}
+    steps:
+      - name: Get latest release version
+        id: get_version
+        run: |
+          LATEST_RELEASE=$(curl -s https://api.github.com/repos/dani-garcia/vaultwarden/releases/latest | jq -r .tag_name)
+          echo "RELEASE_VERSION=${LATEST_RELEASE}" >> $GITHUB_OUTPUT
+
+      - name: Check if Alpine release exists
+        id: check_alpine_release
+        run: |
+          RELEASE_TAG="${{ steps.get_version.outputs.RELEASE_VERSION }}-alpine-extracted"
+          RELEASE_EXISTS=$(curl -s -o /dev/null -w "%{http_code}" https://api.github.com/repos/${{ github.repository }}/releases/tags/${RELEASE_TAG})
+          if [ "$RELEASE_EXISTS" = "200" ]; then
+            echo "Alpine release already exists"
+            echo "exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "Alpine release does not exist, will create"
+            echo "exists=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Check if Debian release exists
+        id: check_debian_release
+        run: |
+          RELEASE_TAG="${{ steps.get_version.outputs.RELEASE_VERSION }}-debian-extracted"
+          RELEASE_EXISTS=$(curl -s -o /dev/null -w "%{http_code}" https://api.github.com/repos/${{ github.repository }}/releases/tags/${RELEASE_TAG})
+          if [ "$RELEASE_EXISTS" = "200" ]; then
+            echo "Debian release already exists"
+            echo "exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "Debian release does not exist, will create"
+            echo "exists=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Get Alpine Release ID
+        id: get_alpine_release_id
+        if: steps.check_alpine_release.outputs.exists == 'true'
+        run: |
+          RELEASE_TAG="${{ steps.get_version.outputs.RELEASE_VERSION }}-alpine-extracted"
+          RELEASE_ID=$(curl -s https://api.github.com/repos/${{ github.repository }}/releases/tags/${RELEASE_TAG} | jq -r .id)
+          echo "RELEASE_ID=${RELEASE_ID}" >> $GITHUB_OUTPUT
+
+      - name: Get Debian Release ID
+        id: get_debian_release_id
+        if: steps.check_debian_release.outputs.exists == 'true'
+        run: |
+          RELEASE_TAG="${{ steps.get_version.outputs.RELEASE_VERSION }}-debian-extracted"
+          RELEASE_ID=$(curl -s https://api.github.com/repos/${{ github.repository }}/releases/tags/${RELEASE_TAG} | jq -r .id)
+          echo "RELEASE_ID=${RELEASE_ID}" >> $GITHUB_OUTPUT
+
+  # ALPINE EXTRACTION JOBS
+  extract-alpine:
+    needs: check-and-prepare
+    if: needs.check-and-prepare.outputs.alpine_release_exists == 'false'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            platform: linux/amd64
+          - arch: arm64
+            platform: linux/arm64
+          - arch: armv7
+            platform: linux/arm/v7
+          - arch: armv6
+            platform: linux/arm/v6
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Extract Alpine Docker image
+        run: |
+          CONTAINER_ID=$(docker create --platform ${{ matrix.platform }} vaultwarden/server:latest-alpine)
+          mkdir -p extracted-alpine-${{ matrix.arch }}
+          docker cp $CONTAINER_ID:/vaultwarden extracted-alpine-${{ matrix.arch }}/
+          docker cp $CONTAINER_ID:/web-vault extracted-alpine-${{ matrix.arch }}/
+          docker rm $CONTAINER_ID
+
+      - name: Zip extracted Alpine files
+        run: |
+          cd extracted-alpine-${{ matrix.arch }}
+          zip -r ../vaultwarden-alpine-${{ matrix.arch }}-extracted.zip vaultwarden web-vault
+
+      - name: Upload Alpine artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vaultwarden-alpine-${{ matrix.arch }}-extracted
+          path: vaultwarden-alpine-${{ matrix.arch }}-extracted.zip
+
+  create-alpine-release:
+    needs: [check-and-prepare, extract-alpine]
+    if: needs.check-and-prepare.outputs.alpine_release_exists == 'false'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create Alpine Release
+        id: create_alpine_release
+        uses: softprops/action-gh-release@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ needs.check-and-prepare.outputs.release_version }}-alpine-extracted
+          name: Alpine Extracted Binaries ${{ needs.check-and-prepare.outputs.release_version }}
+          body: |
+            This release contains extracted binaries from the Vaultwarden Alpine Docker images for multiple Linux architectures.
+            Original release: https://github.com/dani-garcia/vaultwarden/releases/tag/${{ needs.check-and-prepare.outputs.release_version }}
+          draft: false
+          prerelease: false
+
+      - name: Download all Alpine artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: vaultwarden-alpine-*-extracted
+          path: alpine-artifacts
+
+      - name: Upload Alpine Release Assets
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          for arch in amd64 arm64 armv7 armv6; do
+            asset_path="alpine-artifacts/vaultwarden-alpine-${arch}-extracted/vaultwarden-alpine-${arch}-extracted.zip"
+            asset_name="vaultwarden-alpine-${arch}-extracted.zip"
+            curl -L \
+              -X POST \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+              -H "Content-Type: application/zip" \
+              -T "${asset_path}" \
+              "https://uploads.github.com/repos/${{ github.repository }}/releases/${{ steps.create_alpine_release.outputs.id }}/assets?name=${asset_name}"
+          done
+
+  update-existing-alpine-release:
+    needs: check-and-prepare
+    if: needs.check-and-prepare.outputs.alpine_release_exists == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            platform: linux/amd64
+          - arch: arm64
+            platform: linux/arm64
+          - arch: armv7
+            platform: linux/arm/v7
+          - arch: armv6
+            platform: linux/arm/v6
+    steps:
+      - name: Check if Alpine asset exists
+        id: check_alpine_asset
+        run: |
+          ASSET_NAME="vaultwarden-alpine-${{ matrix.arch }}-extracted.zip"
+          ASSET_EXISTS=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" https://api.github.com/repos/${{ github.repository }}/releases/${{ needs.check-and-prepare.outputs.alpine_release_id }}/assets?name=${ASSET_NAME})
+          if [ "$ASSET_EXISTS" = "200" ]; then
+            echo "Alpine asset already exists, skipping extraction and upload"
+            echo "exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "Alpine asset does not exist, will extract and upload"
+            echo "exists=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Checkout code
+        if: steps.check_alpine_asset.outputs.exists == 'false'
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        if: steps.check_alpine_asset.outputs.exists == 'false'
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        if: steps.check_alpine_asset.outputs.exists == 'false'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Extract Alpine Docker image
+        if: steps.check_alpine_asset.outputs.exists == 'false'
+        run: |
+          CONTAINER_ID=$(docker create --platform ${{ matrix.platform }} vaultwarden/server:latest-alpine)
+          mkdir -p extracted-alpine-${{ matrix.arch }}
+          docker cp $CONTAINER_ID:/vaultwarden extracted-alpine-${{ matrix.arch }}/
+          docker cp $CONTAINER_ID:/web-vault extracted-alpine-${{ matrix.arch }}/
+          docker rm $CONTAINER_ID
+
+      - name: Zip extracted Alpine files
+        if: steps.check_alpine_asset.outputs.exists == 'false'
+        run: |
+          cd extracted-alpine-${{ matrix.arch }}
+          zip -r ../vaultwarden-alpine-${{ matrix.arch }}-extracted.zip vaultwarden web-vault
+
+      - name: Upload Alpine Release Asset
+        if: steps.check_alpine_asset.outputs.exists == 'false'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          curl -L \
+            -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Content-Type: application/zip" \
+            -T "vaultwarden-alpine-${{ matrix.arch }}-extracted.zip" \
+            "https://uploads.github.com/repos/${{ github.repository }}/releases/${{ needs.check-and-prepare.outputs.alpine_release_id }}/assets?name=vaultwarden-alpine-${{ matrix.arch }}-extracted.zip"
+
+  # DEBIAN EXTRACTION JOBS
+  extract-debian:
+    needs: check-and-prepare
+    if: needs.check-and-prepare.outputs.debian_release_exists == 'false'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            platform: linux/amd64
+          - arch: arm64
+            platform: linux/arm64
+          - arch: armv7
+            platform: linux/arm/v7
+          - arch: armv6
+            platform: linux/arm/v6
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Extract Debian Docker image
+        run: |
+          CONTAINER_ID=$(docker create --platform ${{ matrix.platform }} vaultwarden/server:latest)
+          mkdir -p extracted-debian-${{ matrix.arch }}
+          docker cp $CONTAINER_ID:/vaultwarden extracted-debian-${{ matrix.arch }}/
+          docker cp $CONTAINER_ID:/web-vault extracted-debian-${{ matrix.arch }}/
+          docker rm $CONTAINER_ID
+
+      - name: Zip extracted Debian files
+        run: |
+          cd extracted-debian-${{ matrix.arch }}
+          zip -r ../vaultwarden-debian-${{ matrix.arch }}-extracted.zip vaultwarden web-vault
+
+      - name: Upload Debian artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vaultwarden-debian-${{ matrix.arch }}-extracted
+          path: vaultwarden-debian-${{ matrix.arch }}-extracted.zip
+
+  create-debian-release:
+    needs: [check-and-prepare, extract-debian]
+    if: needs.check-and-prepare.outputs.debian_release_exists == 'false'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create Debian Release
+        id: create_debian_release
+        uses: softprops/action-gh-release@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ needs.check-and-prepare.outputs.release_version }}-debian-extracted
+          name: Debian Extracted Binaries ${{ needs.check-and-prepare.outputs.release_version }}
+          body: |
+            This release contains extracted binaries from the Vaultwarden Debian Docker images for multiple Linux architectures.
+            Original release: https://github.com/dani-garcia/vaultwarden/releases/tag/${{ needs.check-and-prepare.outputs.release_version }}
+          draft: false
+          prerelease: false
+
+      - name: Download all Debian artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: vaultwarden-debian-*-extracted
+          path: debian-artifacts
+
+      - name: Upload Debian Release Assets
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          for arch in amd64 arm64 armv7 armv6; do
+            asset_path="debian-artifacts/vaultwarden-debian-${arch}-extracted/vaultwarden-debian-${arch}-extracted.zip"
+            asset_name="vaultwarden-debian-${arch}-extracted.zip"
+            curl -L \
+              -X POST \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+              -H "Content-Type: application/zip" \
+              -T "${asset_path}" \
+              "https://uploads.github.com/repos/${{ github.repository }}/releases/${{ steps.create_debian_release.outputs.id }}/assets?name=${asset_name}"
+          done
+
+  update-existing-debian-release:
+    needs: check-and-prepare
+    if: needs.check-and-prepare.outputs.debian_release_exists == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            platform: linux/amd64
+          - arch: arm64
+            platform: linux/arm64
+          - arch: armv7
+            platform: linux/arm/v7
+          - arch: armv6
+            platform: linux/arm/v6
+    steps:
+      - name: Check if Debian asset exists
+        id: check_debian_asset
+        run: |
+          ASSET_NAME="vaultwarden-debian-${{ matrix.arch }}-extracted.zip"
+          ASSET_EXISTS=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" https://api.github.com/repos/${{ github.repository }}/releases/${{ needs.check-and-prepare.outputs.debian_release_id }}/assets?name=${ASSET_NAME})
+          if [ "$ASSET_EXISTS" = "200" ]; then
+            echo "Debian asset already exists, skipping extraction and upload"
+            echo "exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "Debian asset does not exist, will extract and upload"
+            echo "exists=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Checkout code
+        if: steps.check_debian_asset.outputs.exists == 'false'
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        if: steps.check_debian_asset.outputs.exists == 'false'
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        if: steps.check_debian_asset.outputs.exists == 'false'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Extract Debian Docker image
+        if: steps.check_debian_asset.outputs.exists == 'false'
+        run: |
+          CONTAINER_ID=$(docker create --platform ${{ matrix.platform }} vaultwarden/server:latest)
+          mkdir -p extracted-debian-${{ matrix.arch }}
+          docker cp $CONTAINER_ID:/vaultwarden extracted-debian-${{ matrix.arch }}/
+          docker cp $CONTAINER_ID:/web-vault extracted-debian-${{ matrix.arch }}/
+          docker rm $CONTAINER_ID
+
+      - name: Zip extracted Debian files
+        if: steps.check_debian_asset.outputs.exists == 'false'
+        run: |
+          cd extracted-debian-${{ matrix.arch }}
+          zip -r ../vaultwarden-debian-${{ matrix.arch }}-extracted.zip vaultwarden web-vault
+
+      - name: Upload Debian Release Asset
+        if: steps.check_debian_asset.outputs.exists == 'false'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          curl -L \
+            -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Content-Type: application/zip" \
+            -T "vaultwarden-debian-${{ matrix.arch }}-extracted.zip" \
+            "https://uploads.github.com/repos/${{ github.repository }}/releases/${{ needs.check-and-prepare.outputs.debian_release_id }}/assets?name=vaultwarden-debian-${arch}-extracted.zip"
